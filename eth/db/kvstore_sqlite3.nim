@@ -1,17 +1,21 @@
 # nim-eth
-# Copyright (c) 2019-2023 Status Research & Development GmbH
+# Copyright (c) 2019-2025 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
 # at your option. This file may not be copied, modified, or distributed except according to those terms.
 
 ## Implementation of KvStore based on sqlite3
+##
+## Supports tiered storage via ATTACH DATABASE - tables can be created in
+## different database files (potentially on different storage tiers) while
+## sharing a single connection with cross-database transaction support.
 
 {.push raises: [].}
 {.pragma: callback, gcsafe, raises: [].}
 
 import
-  std/[os, options, strformat, typetraits],
+  std/[os, options, strformat, strutils, tables, typetraits, uri],
   sqlite3_abi,
   ./kvstore
 
@@ -32,25 +36,49 @@ type
   NoParams* = tuple # this is the empty tuple
   ResultHandler*[T] = proc(val: T) {.callback.}
 
+  AttachedDb* = object
+    ## Represents an attached database that can be used for tiered storage.
+    ## Tables in attached databases are accessed via schema-qualified names.
+    schema*: string  ## Schema name used to prefix table names
+    path*: string  ## Path to the attached database file
+    readOnly*: bool  ## Whether SQLite opened the database read-only
+
   SqStoreRef* = ref object
     # Handle for a single database - from here, keyspaces and statements
-    # can be created
+    # can be created. Supports attaching additional databases for tiered storage.
     env: Sqlite
     managedStmts: seq[RawStmtPtr]
     readOnly*: bool
+    attachedDbs: Table[string, AttachedDb]  # schema -> AttachedDb
 
   SqStoreCheckpointKind* {.pure.} = enum
     passive, full, restart, truncate
 
   SqKeyspace* = object of RootObj
     # A Keyspace is a single key-value table - it is generally efficient to
-    # create separate keyspaces for each type of data stored
+    # create separate keyspaces for each type of data stored.
+    # Tables can be in the main database or in an attached database (tiered storage).
     open: bool
     env: Sqlite
     getStmt, putStmt, delStmt, clearStmt, containsStmt,
       findStmt0, findStmt1, findStmt2: RawStmtPtr
 
   SqKeyspaceRef* = ref SqKeyspace
+
+func quoteIdentifier(identifier: string): string =
+  ## Quote an SQLite identifier, escaping embedded double quotes.
+  result = newStringOfCap(identifier.len + 2)
+  result.add('"')
+  for c in identifier:
+    if c == '"':
+      result.add("\"\"")
+    else:
+      result.add(c)
+  result.add('"')
+
+func readOnlyUri(path: string): string =
+  ## URI filenames are the only way to set the mode of an attached database.
+  "file:" & encodeUrl(path, usePlus = false) & "?mode=ro"
 
 template dispose(db: Sqlite) =
   discard sqlite3_close(db)
@@ -119,6 +147,9 @@ proc bindParam(s: RawStmtPtr, n: int, val: auto): cint =
         sqlite3_bind_blob(s, n.cint, nil, 0.cint, nil)
     else:
       {.fatal: "Please add support for the '" & $typeof(val) & "' type".}
+  elif val is string:
+    sqlite3_bind_text(
+      s, n.cint, cstring(val), val.len.cint, SQLITE_TRANSIENT)
   elif val is SomeInteger:
     sqlite3_bind_int64(s, n.cint, val.clong)
   elif val is Option:
@@ -505,6 +536,11 @@ proc close*(db: SqStoreRef) =
   for stmt in db.managedStmts:
     discard sqlite3_finalize(stmt)
 
+  # Detach all attached databases before closing
+  for schema, _ in db.attachedDbs:
+    let sql = "DETACH DATABASE " & quoteIdentifier(schema) & ";"
+    discard sqlite3_exec(db.env, cstring(sql), nil, nil, nil)
+
   # Lazy-v2-close allows closing the keyspaces in any order
   discard sqlite3_close_v2(db.env)
 
@@ -517,6 +553,18 @@ proc checkpoint*(db: SqStoreRef, kind = SqStoreCheckpointKind.passive) =
   of SqStoreCheckpointKind.restart: SQLITE_CHECKPOINT_RESTART
   of SqStoreCheckpointKind.truncate: SQLITE_CHECKPOINT_TRUNCATE
   discard sqlite3_wal_checkpoint_v2(db.env, nil, mode, nil, nil)
+
+proc checkpointDatabase*(db: SqStoreRef, schema: string,
+                         kind = SqStoreCheckpointKind.passive) =
+  ## Checkpoint a specific database (main or attached).
+  ## Use empty string for main database, or schema name for attached databases.
+  let mode: cint = case kind
+  of SqStoreCheckpointKind.passive: SQLITE_CHECKPOINT_PASSIVE
+  of SqStoreCheckpointKind.full: SQLITE_CHECKPOINT_FULL
+  of SqStoreCheckpointKind.restart: SQLITE_CHECKPOINT_RESTART
+  of SqStoreCheckpointKind.truncate: SQLITE_CHECKPOINT_TRUNCATE
+  let schemaPtr = if schema.len == 0: nil else: cstring(schema)
+  discard sqlite3_wal_checkpoint_v2(db.env, schemaPtr, mode, nil, nil)
 
 template prepare(env: ptr sqlite3, q: string): ptr sqlite3_stmt =
   block:
@@ -554,6 +602,14 @@ proc init*(
     readOnly = false,
     inMemory = false,
     manualCheckpoint = false): KvResult[T] =
+  ## Initialize a SQLite database store.
+  ##
+  ## Parameters:
+  ##   basePath: Directory where the database file will be created
+  ##   name: Database name (file will be name.sqlite3)
+  ##   readOnly: Open in read-only mode
+  ##   inMemory: Use in-memory database (for testing)
+  ##   manualCheckpoint: Disable auto-checkpointing for better write performance
   var env: AutoDisposed[ptr sqlite3]
   defer: disposeIfUnreleased(env)
 
@@ -561,11 +617,11 @@ proc init*(
     name =
       if inMemory: ":memory:"
       else: basePath / name & ".sqlite3"
-    flags =
+    flags = SQLITE_OPEN_URI or
       # For some reason, opening multiple in-memory databases doesn't work if
       # one of them is read-only - for now, disable read-only mode for them
-      if readOnly and not inMemory: SQLITE_OPEN_READONLY
-      else: SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE
+      (if readOnly and not inMemory: SQLITE_OPEN_READONLY
+       else: SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE)
 
   if not inMemory:
     try:
@@ -610,53 +666,204 @@ proc init*(
 
   ok(SqStoreRef(
     env: env.release,
-    readOnly: readOnly
+    readOnly: readOnly,
+    attachedDbs: initTable[string, AttachedDb]()
   ))
 
-proc hasTable*(db: SqStoreRef, name: string): KvResult[bool] =
+proc attachDatabase*(
+    db: SqStoreRef,
+    path: string,
+    schema: string,
+    readOnly = false): KvResult[AttachedDb] =
+  ## Attach an external SQLite database file to the current connection.
+  ##
+  ## This enables tiered storage where different tables can be stored in
+  ## different database files (potentially on different storage devices).
+  ## All attached databases share the same connection and can participate
+  ## in cross-database transactions.
+  ##
+  ## Parameters:
+  ##   path: Full path to the database file. Writable attachments create it if
+  ##         needed; read-only attachments require an existing file.
+  ##   schema: Schema name used to reference tables in this database.
+  ##           Must be a valid SQLite identifier (alphanumeric + underscore).
+  ##   readOnly: Open the file with SQLite's read-only URI mode and prevent
+  ##             mutating keyspace operations.
+  ##
+  ## Returns:
+  ##   AttachedDb object that can be used with openKvStore()
+  ##
+  ## Example:
+  ##   let coldDb = db.attachDatabase("/slow/disk/cold.sqlite3", "cold")
+  ##   let coldStore = db.openKvStore("old_blocks", schema = "cold")
+
+  if schema.len == 0:
+    return err("sqlite: schema name cannot be empty")
+
+  # "main" and "temp" are reserved SQLite schema names
+  if schema.cmpIgnoreCase("main") == 0 or schema.cmpIgnoreCase("temp") == 0:
+    return err("sqlite: schema '" & schema & "' is reserved by SQLite")
+
+  if schema in db.attachedDbs:
+    return err("sqlite: schema '" & schema & "' is already attached")
+
+  # Validate schema name (basic check for SQL injection prevention)
+  for c in schema:
+    if c notin {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+      return err("sqlite: invalid schema name '" & schema &
+                 "' - use only alphanumeric characters and underscores")
+
+  if '\0' in path:
+    return err("sqlite: database path cannot contain a null byte")
+
+  let effectiveReadOnly = readOnly or db.readOnly
+
+  # Create parent directory if needed for a writable database. A read-only
+  # attachment must already exist and must not mutate the filesystem.
+  let databaseDir = parentDir(path)
+  if not effectiveReadOnly and databaseDir.len > 0:
+    try:
+      createDir(databaseDir)
+    except OSError, IOError:
+      return err("sqlite: cannot create directory for attached database")
+
   let
-    sql = "SELECT name FROM sqlite_master WHERE type='table' AND name='" &
-      name & "';"
-  db.exec(sql, (), proc(_: openArray[byte]) {.callback.} = discard)
+    quotedSchema = quoteIdentifier(schema)
+    attachPath = if effectiveReadOnly: readOnlyUri(path) else: path
+    attachSql = "ATTACH DATABASE ? AS " & quotedSchema & ";"
+    attachResult = db.exec(attachSql, (attachPath,))
+  if attachResult.isErr:
+    return err(attachResult.error)
+
+  let attached = AttachedDb(
+    schema: schema,
+    path: path,
+    readOnly: effectiveReadOnly
+  )
+  # Track the attachment before configuring it. If rollback itself fails, the
+  # caller can still discover and detach the database explicitly.
+  db.attachedDbs[schema] = attached
+
+  # Enable WAL mode for the attached database (if not read-only)
+  if not effectiveReadOnly:
+    let walResult = db.exec(
+      "PRAGMA " & quotedSchema & ".journal_mode = WAL;", (),
+      proc(_: openArray[byte]) {.callback.} = discard)
+    let setupResult = if walResult.isErr:
+      KvResult[void].err(walResult.error)
+    else:
+      db.exec("PRAGMA " & quotedSchema & ".synchronous = NORMAL;")
+
+    if setupResult.isErr:
+      let detachResult = db.exec("DETACH DATABASE " & quotedSchema & ";")
+      if detachResult.isOk:
+        db.attachedDbs.del(schema)
+        return err(setupResult.error)
+      return err(setupResult.error & "; failed to roll back attachment: " &
+        detachResult.error)
+
+  ok(attached)
+
+proc detachDatabase*(db: SqStoreRef, schema: string): KvResult[void] =
+  ## Detach a previously attached database.
+  ##
+  ## Note: All keyspaces opened from this database should be closed first.
+  if schema notin db.attachedDbs:
+    return err("sqlite: schema '" & schema & "' is not attached")
+
+  let detachSql = "DETACH DATABASE " & quoteIdentifier(schema) & ";"
+  checkExec db.env, detachSql
+
+  db.attachedDbs.del(schema)
+  ok()
+
+proc getAttachedDatabases*(db: SqStoreRef): seq[AttachedDb] =
+  ## Return list of all attached databases.
+  result = @[]
+  for _, attached in db.attachedDbs:
+    result.add(attached)
+
+proc hasTable*(db: SqStoreRef, name: string, schema = ""): KvResult[bool] =
+  ## Check if a table exists in the main database or an attached database.
+  let masterTable = if schema.len > 0:
+    quoteIdentifier(schema) & ".sqlite_master"
+  else:
+    "sqlite_master"
+  let sql = "SELECT name FROM " & masterTable &
+            " WHERE type = 'table' AND name = ?;"
+  db.exec(sql, (name,), proc(_: openArray[byte]) {.callback.} = discard)
 
 proc openKvStore*(
-    db: SqStoreRef, name = "kvstore", withoutRowid = false,
-    readOnly = false): KvResult[SqKeyspaceRef] =
-  ## Open a new Key-Value store in the SQLite database
+    db: SqStoreRef,
+    name = "kvstore",
+    withoutRowid = false,
+    readOnly = false,
+    schema = ""): KvResult[SqKeyspaceRef] =
+  ## Open a new Key-Value store in the SQLite database.
   ##
-  ## withoutRowid: Create the table without rowid - this is more efficient when
-  ##               rows are small (<200 bytes) but very inefficient with larger
-  ##               rows (the row being the sum of key and value) - see
-  ##               https://www.sqlite.org/withoutrowid.html
+  ## Parameters:
+  ##   name: Table name for the key-value store
+  ##   withoutRowid: Create the table without rowid - this is more efficient when
+  ##                 rows are small (<200 bytes) but very inefficient with larger
+  ##                 rows (the row being the sum of key and value) - see
+  ##                 https://www.sqlite.org/withoutrowid.html
+  ##   readOnly: Open in read-only mode (no writes allowed)
+  ##   schema: Schema name for attached database (empty = main database).
+  ##           Use the schema from attachDatabase() for tiered storage.
   ##
-  let hasTable = if db.readOnly or readOnly:
-    ? db.hasTable(name)
+  ## Example:
+  ##   # Main database (fast storage)
+  ##   let hotStore = db.openKvStore("recent_blocks")
+  ##
+  ##   # Attached database (slow storage)
+  ##   let coldDb = db.attachDatabase("/slow/cold.sqlite3", "cold")
+  ##   let coldStore = db.openKvStore("old_blocks", schema = "cold")
+
+  # Validate schema if provided
+  if schema.len > 0 and schema notin db.attachedDbs:
+    return err("sqlite: schema '" & schema & "' is not attached - call attachDatabase first")
+
+  # Build schema-qualified table name
+  let qualifiedName = if schema.len > 0:
+    quoteIdentifier(schema) & "." & quoteIdentifier(name)
+  else:
+    quoteIdentifier(name)
+  let effectiveReadOnly = db.readOnly or readOnly or
+    (schema.len > 0 and db.attachedDbs.getOrDefault(schema).readOnly)
+
+  let hasTable = if effectiveReadOnly:
+    ? db.hasTable(name, schema)
   else:
     let createSql = """
-      CREATE TABLE IF NOT EXISTS '""" & name & """' (
+      CREATE TABLE IF NOT EXISTS """ & qualifiedName & """ (
          key BLOB PRIMARY KEY,
          value BLOB
       )"""
     checkExec db.env,
       if withoutRowid: createSql & " WITHOUT ROWID;" else: createSql & ";"
     true
+
   var
     tmp = SqKeyspace(env: db.env)
   defer:
     # We'll "move" ownership to the return value, effectively disabling "close"
     close(tmp)
   tmp.open = true
+
   if hasTable:
     tmp.getStmt =
-      prepare(db.env, "SELECT value FROM '" & name & "' WHERE key = ?;")
-    tmp.putStmt =
-      prepare(db.env, "INSERT OR REPLACE INTO '" & name & "'(key, value) VALUES (?, ?);")
-    tmp.delStmt = prepare(db.env, "DELETE FROM '" & name & "' WHERE key = ?;")
-    tmp.clearStmt = prepare(db.env, "DELETE FROM '" & name & "';")
-    tmp.containsStmt = prepare(db.env, "SELECT 1 FROM '" & name & "' WHERE key = ?;")
-    tmp.findStmt0 = prepare(db.env, "SELECT key, value FROM '" & name & "';")
-    tmp.findStmt1 = prepare(db.env, "SELECT key, value FROM '" & name & "' WHERE key >= ?;")
-    tmp.findStmt2 = prepare(db.env, "SELECT key, value FROM '" & name & "' WHERE key >= ? and key < ?;")
+      prepare(db.env, "SELECT value FROM " & qualifiedName & " WHERE key = ?;")
+    if not effectiveReadOnly:
+      tmp.putStmt = prepare(db.env,
+        "INSERT OR REPLACE INTO " & qualifiedName &
+        "(key, value) VALUES (?, ?);")
+      tmp.delStmt = prepare(db.env,
+        "DELETE FROM " & qualifiedName & " WHERE key = ?;")
+      tmp.clearStmt = prepare(db.env, "DELETE FROM " & qualifiedName & ";")
+    tmp.containsStmt = prepare(db.env, "SELECT 1 FROM " & qualifiedName & " WHERE key = ?;")
+    tmp.findStmt0 = prepare(db.env, "SELECT key, value FROM " & qualifiedName & ";")
+    tmp.findStmt1 = prepare(db.env, "SELECT key, value FROM " & qualifiedName & " WHERE key >= ?;")
+    tmp.findStmt2 = prepare(db.env, "SELECT key, value FROM " & qualifiedName & " WHERE key >= ? and key < ?;")
 
   var res = SqKeyspaceRef()
   res[] = tmp
